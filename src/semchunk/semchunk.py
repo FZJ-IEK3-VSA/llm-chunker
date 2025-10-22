@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import math
 import inspect
+import logging
 
+from bisect import bisect_left as python_bisect_left
 from typing import Callable, Sequence, TYPE_CHECKING
 from itertools import accumulate
 from contextlib import suppress
@@ -60,7 +62,7 @@ _REGEX_ESCAPED_NON_WHITESPACE_SEMANTIC_SPLITTERS = tuple(re.escape(splitter) for
 def _split_text(text: str) -> tuple[str, bool, list[str]]:
     """Split text using the most semantically meaningful splitter possible."""
 
-    splitter_is_whitespace = True
+    splitter_is_whitespace_or_zero_width = True
 
     # Try splitting at, in order of most desirable to least desirable:
     # - The largest sequence of newlines and/or carriage returns;
@@ -83,21 +85,38 @@ def _split_text(text: str) -> tuple[str, bool, list[str]]:
                     splitter = whitespace_preceded_by_preceder.group(1)
                     escaped_splitter = re.escape(splitter)
                     
-                    return splitter, splitter_is_whitespace, re.split(rf'(?<={escaped_preceder}){escaped_splitter}', text)
+                    return splitter, splitter_is_whitespace_or_zero_width, re.split(rf'(?<={escaped_preceder}){escaped_splitter}', text)
 
     else:
         # Identify the most desirable semantically meaningful non-whitespace splitter present in the text.
         for splitter in _NON_WHITESPACE_SEMANTIC_SPLITTERS:
             if splitter in text:
-                splitter_is_whitespace = False
+                splitter_is_whitespace_or_zero_width = False
                 break
 
         # If no semantically meaningful splitter is present in the text, return an empty string as the splitter and the text as a list of characters.
         else:  # NOTE This code block will only be executed if the for loop completes without breaking.
-            return "", splitter_is_whitespace, list(text)
+            return "", splitter_is_whitespace_or_zero_width, list(text)
 
     # Return the splitter and the split text.
-    return splitter, splitter_is_whitespace, text.split(splitter)
+    return splitter, splitter_is_whitespace_or_zero_width, text.split(splitter)
+
+
+def _split_text_at_semantic_boundary(text: str, semantic_boundary_start_chars: list[int], char_offset: int) -> tuple[str, bool, list[str]]:
+    """Split text at user provided semantic boundaries."""
+    splits = []
+    start = 0 - char_offset
+    for boundary in semantic_boundary_start_chars[1:]:
+        b = boundary - char_offset
+        if start > len(text):
+            break
+        elif start >= 0:
+            splits.append(text[start:b])            
+        start = b
+
+    splits.append(text[start:])
+
+    return splits
 
 
 def bisect_left(sorted: list, target: int, low: int, high: int) -> int:
@@ -153,7 +172,10 @@ def chunk(
     memoize: bool = True,
     offsets: bool = False,
     overlap: float | int | None = None,
+    non_destructive: bool = False,
+    as_tuples: bool = False,
     cache_maxsize: int | None = None,
+    semantic_boundaries: tuple[tuple[int]] | None = None,
     _recursion_depth: int = 0,
     _start: int = 0,
 ) -> list[str] | tuple[list[str], list[tuple[int, int]]]:
@@ -166,6 +188,8 @@ def chunk(
         memoize (bool, optional): Whether to memoize the token counter. Defaults to `True`.
         offsets (bool, optional): Whether to return the start and end offsets of each chunk. Defaults to `False`.
         overlap (float | int | None, optional): The proportion of the chunk size, or, if >=1, the number of tokens, by which chunks should overlap. Defaults to `None`, in which case no overlapping occurs.
+        non_destructive (bool, optional): Whether to return the chunks in a non-destructive manner, that is, joining all chunks will yield the original text. Defaults to False. Only used with `offsets` set to `True`.
+        as_tuples (bool, optional): Whether to return the offsets as a list of (start, end) tuples paired with their corresponding chunks. Defaults to `False`.
         cache_maxsize (int | None, optional): The maximum number of text-token count pairs that can be stored in the token counter's cache. Defaults to `None`, which makes the cache unbounded. This argument is only used if `memoize` is `True`.
 
     Returns:
@@ -177,10 +201,24 @@ def chunk(
 
     # If this is the first call, memoize the token counter if memoization is enabled and reduce the effective chunk size if overlapping chunks.
     if is_first_call := not _recursion_depth:
+
+        if local_chunk_size < 50:
+            logging.warning(
+                f"""
+                Chunk size of {local_chunk_size} is very small. Because the semantic structure 
+                cannot be fully utilized with small chunk sizes and the algorithm is slower for 
+                small chunk sizes, we suggest simply using a tokenizer and splitting the output 
+                according to the desired chunk size for better performance.
+                """
+            )
+
         if memoize:
             token_counter = _memoized_token_counters.setdefault(token_counter, lru_cache(cache_maxsize)(token_counter))
 
         if overlap:
+            if non_destructive:
+                raise ValueError("Overlapping chunks cannot be returned in a non-destructive manner. Set `non_destructive` to `False`.")
+
             # Make relative overlaps absolute and floor both relative and absolute overlaps to prevent ever having an overlap >= chunk_size.
             overlap = math.floor(chunk_size * overlap) if overlap < 1 else min(overlap, chunk_size - 1)
 
@@ -190,7 +228,22 @@ def chunk(
                 local_chunk_size = min(overlap, unoverlapped_chunk_size)
 
     # Split the text using the most semantically meaningful splitter possible.
-    splitter, splitter_is_whitespace, splits = _split_text(text)
+    if semantic_boundaries != None:        
+        if len(semantic_boundaries) > _recursion_depth:
+            # Split text at pre-determined boundaries.            
+            splits = _split_text_at_semantic_boundary(text, semantic_boundaries[_recursion_depth], _start)
+        else:   
+            # Maximum recursion depth reached. Just split text in half. 
+            # This is unlikely to happen when the semantic boundaries include token boundaries.
+            splits = [text[:len(text)//2], text[len(text)//2:]]
+        
+        # Splitter is zero-width.
+        splitter_is_whitespace_or_zero_width = True
+        splitter = ""
+
+    else:
+        # Split text at trigger chars.
+        splitter, splitter_is_whitespace_or_zero_width, splits = _split_text(text)
 
     offsets: list = []
     splitter_len = len(splitter)
@@ -217,6 +270,8 @@ def chunk(
                 chunk_size=local_chunk_size,
                 token_counter=token_counter,
                 offsets=return_offsets,
+                non_destructive=non_destructive,
+                semantic_boundaries=semantic_boundaries,
                 _recursion_depth=_recursion_depth + 1,
                 _start=split_start,
             )
@@ -240,6 +295,9 @@ def chunk(
             # Mark any splits included in the new chunk for exclusion from future chunks.
             skips.update(range(i + 1, final_split_in_chunk_i))
 
+            if non_destructive:
+                assert new_chunk in text
+
             # Add the chunk.
             chunks.append(new_chunk)
 
@@ -248,7 +306,7 @@ def chunk(
             offsets.append((split_start, split_end))
 
         # If the splitter is not whitespace and the split is not the last split, add the splitter to the end of the latest chunk if doing so would not cause it to exceed the chunk size otherwise add the splitter as a new chunk.
-        if not splitter_is_whitespace and not (
+        if splitter_len > 0 and (not splitter_is_whitespace_or_zero_width or non_destructive) and not (
             i == len(splits) - 1 or all(j in skips for j in range(i + 1, len(splits)))
         ):
             if token_counter(last_chunk_with_splitter := chunks[-1] + splitter) <= local_chunk_size:
@@ -264,8 +322,14 @@ def chunk(
 
     # If this is the first call, remove any empty chunks as well as chunks comprised entirely of whitespace and then overlap the chunks if desired and finally return the chunks, optionally with their offsets.
     if is_first_call:
-        # Remove empty chunks.
-        chunks_and_offsets = [(chunk, offset) for chunk, offset in zip(chunks, offsets) if chunk and not chunk.isspace()]
+
+        if non_destructive:
+            # Check that operations were indeed non-destructive.
+            assert "".join(chunks) == text, "The chunks do not re-construct the original text."
+        
+        # Remove empty chunks and, in destructive mode, also chunks comprised entirely of whitespace
+        # Note that using a chunk size of 1 in non-destructive mode inevitably leads to whitespace-only chunks.
+        chunks_and_offsets = [(chunk, offset) for chunk, offset in zip(chunks, offsets) if chunk and (non_destructive or not chunk.isspace())]
         
         if chunks_and_offsets:
             chunks, offsets = zip(*chunks_and_offsets)
@@ -302,12 +366,130 @@ def chunk(
 
         # Return offsets if desired.
         if return_offsets:
-            return chunks, offsets
+            if as_tuples:
+                # Pack offsets and chunks into list of ((start, end), chunk) tuples.
+                return list(zip(offsets, chunks))
+            else:
+                return chunks, offsets
 
         return chunks
 
     # Always return chunks and offsets if this is a recursive call.
     return chunks, offsets
+
+
+def get_single_centered_chunk(text: str, centering_char_offsets: tuple[int, int], chunk_size: int, semantic_boundaries: tuple[tuple[int]], token_counter: callable, offsets: bool=False) -> tuple[int, str]:
+    """Get meaningful chunk of text that contains the centering span. The chunk is constructed by taking the largest meaningful chunk that contains the centering span and iteratively removing or adding parts until it is under the chunk size going from larger to smaller semantic meaningul chunks. As information before the centering span is more important in more case, the parts are removed from the back first. If the chunk is still over the chunk size, parts are removed from the front. 
+
+    Args:
+        text (str): The text to be chunked.
+        centering_char_offsets (tuple[int, int]): The character offsets of the centering span.
+        chunk_size (int): The maximum number of tokens a chunk may contain.
+        semantic_boundaries (tuple[tuple[int]]): The character offsets of the semantic boundaries.        
+        token_counter (callable): A callable that takes a string and returns the number of tokens in it.
+        offsets (bool, optional): Whether to return the start and end offsets of the chunk. Defaults to `False`.
+    
+    Returns:
+        tuple[int, str]: The start character offset of the chunk and the chunk itself.
+    """
+
+    centering_span = text[centering_char_offsets[0]:centering_char_offsets[1]]
+    if token_counter(centering_span) > chunk_size:
+        raise ValueError("The centering span exceeds the chunk size.")
+
+    # Get largest semantic meaningful chunk that contains the centering span.    
+    chunk_start_idx = max(0, python_bisect_left(semantic_boundaries[0], centering_char_offsets[0]) - 1)
+    chunk_end_idx = max(0, python_bisect_left(semantic_boundaries[0], centering_char_offsets[1]) - 1)
+    chunk_start_char = semantic_boundaries[0][chunk_start_idx]
+    chunk_end_char = semantic_boundaries[0][chunk_end_idx + 1] if chunk_end_idx + 1 < len(semantic_boundaries[0]) else len(text)    
+    chunk = text[chunk_start_char:chunk_end_char]
+
+    chunk_token_count = token_counter(chunk.strip())
+    if chunk_token_count < chunk_size:
+        # Iteratively add parts to the chunk until it is just under the chunk size.
+        for d in range(0, len(semantic_boundaries)):
+            # First, add parts to the front.            
+            if chunk_start_char == 0:
+                success = False                                                
+            else:   
+                success = True
+                while chunk_token_count < chunk_size:
+                    chunk_sent_before_start_idx = max(0, python_bisect_left(semantic_boundaries[d], chunk_start_char) - 1)
+                    new_chunk_start_char = semantic_boundaries[d][chunk_sent_before_start_idx]
+                    new_chunk = text[new_chunk_start_char:chunk_end_char]
+                    new_chunk_token_count = token_counter(new_chunk.strip())
+                    if new_chunk_token_count > chunk_size or new_chunk_start_char == chunk_start_char:
+                        success = False
+                        break
+                    else:
+                        chunk_start_char = new_chunk_start_char
+                        chunk_token_count = new_chunk_token_count
+                                            
+            # Add parts to the back.
+            if not success:
+                if chunk_end_char == len(text):
+                    success = False
+                else:
+                    success = True                    
+                    while chunk_token_count < chunk_size:
+                        chunk_sent_after_end_idx = max(0, python_bisect_left(semantic_boundaries[d], chunk_end_char))
+                        new_chunk_end_char = semantic_boundaries[d][chunk_sent_after_end_idx + 1] if chunk_sent_after_end_idx + 1 < len(semantic_boundaries[d]) else len(text)
+                        new_chunk = text[chunk_start_char:new_chunk_end_char]
+                        new_chunk_token_count = token_counter(new_chunk.strip())
+                        if new_chunk_token_count > chunk_size or new_chunk_end_char == chunk_end_char:                        
+                            success = False
+                            break
+                        else:
+                            chunk_end_char = new_chunk_end_char
+                            chunk_token_count = new_chunk_token_count
+
+            if success or (chunk_start_char == 0 and chunk_end_char == len(text)):
+                break
+
+        chunk = text[chunk_start_char:chunk_end_char]
+
+    else:
+        # Iteratively remove parts from the chunk until it is under the chunk size.
+        for d in range(1, len(semantic_boundaries)):
+            success = True
+            while token_counter(chunk.strip()) > chunk_size:
+                # First, remove parts from back.        
+                chunk_last_sent_start_idx = max(0, python_bisect_left(semantic_boundaries[d], chunk_end_char) - 1)
+                new_chunk_end_char = semantic_boundaries[d][chunk_last_sent_start_idx]
+                if new_chunk_end_char < centering_char_offsets[1] or new_chunk_end_char == chunk_end_char:
+                    success = False
+                    break
+                else:
+                    chunk = text[chunk_start_char:new_chunk_end_char]
+                    chunk_end_char = new_chunk_end_char
+
+            if not success:
+                success = True
+                while token_counter(chunk.strip()) > chunk_size:
+                    # Remove parts from front.
+                    chunk_first_sent_end_idx = max(0, python_bisect_left(semantic_boundaries[d], chunk_start_char))
+                    new_chunk_start_char =  semantic_boundaries[d][chunk_first_sent_end_idx + 1] if chunk_first_sent_end_idx + 1 < len(semantic_boundaries[d]) else len(text)
+                    if new_chunk_start_char > centering_char_offsets[0] or new_chunk_start_char == chunk_start_char:
+                        success = False
+                        break
+                    else:
+                        chunk = text[new_chunk_start_char:chunk_end_char]
+                        chunk_start_char = new_chunk_start_char
+
+            if success:
+                break       
+   
+        if not success:
+            # Chunk is still too large.
+            raise NotImplementedError("Could not get a chunk that contains the centering span and is under the chunk size. This should not happen.")    
+    
+    chunk = chunk.rstrip()
+
+    if offsets:
+        chunk_end_char = chunk_start_char + len(chunk)
+        return (chunk_start_char, chunk_end_char), chunk
+    else:
+        return chunk
 
 
 class Chunker:
